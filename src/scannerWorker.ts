@@ -1,7 +1,22 @@
 import * as fs from 'node:fs';
 import { parentPort } from 'node:worker_threads';
 
-type UsageEvent = { timestamp: number; model: string; charge: number; eventId: string };
+type UsageEvent = {
+  timestamp: number;
+  model: string;
+  charge: number;
+  eventId: string;
+  /** Conversation / thread id; empty when the record does not carry one. */
+  sessionId: string;
+  /** Agent or panel that spent the charge, e.g. `panel/editAgent`. */
+  mode: string;
+  /** Prompt tokens served from cache. */
+  cachedTokens: number;
+  /** Total prompt tokens, the cache denominator. */
+  inputTokens: number;
+  /** Assistant tokens produced. */
+  outputTokens: number;
+};
 type Request = { files: string[]; monthBoundary: number; scanBoundary: number };
 type Response = { file: string; size: number; mtimeMs: number; events: UsageEvent[] };
 
@@ -14,8 +29,12 @@ type FileState = {
 };
 
 const cache = new Map<string, FileState>();
-/** Bytes read from the end of a file we have never seen before. */
-const initialTailBytes = 8 * 1024 * 1024;
+/** Chunk size used when streaming a previously unseen file from the start. */
+const readChunkBytes = 4 * 1024 * 1024;
+
+function toNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+}
 
 function parseText(text: string, monthBoundary: number): UsageEvent[] {
   const events: UsageEvent[] = [];
@@ -41,12 +60,22 @@ function parseText(text: string, monthBoundary: number): UsageEvent[] {
     let model: string | undefined;
     let charge: number | undefined;
     let eventId: string | undefined;
+    let sessionId = '';
+    let mode = '';
+    let cachedTokens = 0;
+    let inputTokens = 0;
+    let outputTokens = 0;
 
     if (record?.type === 'llm_request') {
       timestamp = typeof record.ts === 'number' ? record.ts : undefined;
       model = typeof record.attrs?.model === 'string' ? record.attrs.model : undefined;
       charge = typeof record.attrs?.copilotUsageNanoAiu === 'number' ? record.attrs.copilotUsageNanoAiu : undefined;
       eventId = typeof record.spanId === 'string' ? `${timestamp}.${record.spanId}` : undefined;
+      sessionId = typeof record.sid === 'string' ? record.sid : '';
+      mode = typeof record.attrs?.debugName === 'string' ? record.attrs.debugName : '';
+      cachedTokens = toNumber(record.attrs?.cachedTokens);
+      inputTokens = toNumber(record.attrs?.inputTokens);
+      outputTokens = toNumber(record.attrs?.outputTokens);
     } else if (record?.kind === 'modelCall') {
       timestamp = typeof record.ts === 'string' ? Date.parse(record.ts) : undefined;
       model = typeof record.model === 'string' ? record.model : undefined;
@@ -54,6 +83,7 @@ function parseText(text: string, monthBoundary: number): UsageEvent[] {
       charge = total >= previousAiu ? total - previousAiu : total;
       previousAiu = total;
       eventId = typeof record.eventId === 'string' ? record.eventId : undefined;
+      sessionId = typeof record.sessionId === 'string' ? record.sessionId : '';
     }
 
     if (!timestamp || !model || !charge || charge <= 0 || !Number.isFinite(charge) || !eventId) {
@@ -63,7 +93,7 @@ function parseText(text: string, monthBoundary: number): UsageEvent[] {
       continue;
     }
 
-    events.push({ timestamp, model, charge, eventId });
+    events.push({ timestamp, model, charge, eventId, sessionId, mode, cachedTokens, inputTokens, outputTokens });
   }
 
   return events;
@@ -88,6 +118,51 @@ function readRange(file: string, start: number, end: number, skipFirstLine: bool
   }
   const newline = text.indexOf('\n');
   return newline === -1 ? '' : text.slice(newline + 1);
+}
+
+/**
+ * Streams a previously unseen file from byte 0 in chunks, keeping only
+ * complete lines, so large logs are fully accounted for without loading the
+ * whole file or the whole event list twice. Lines older than the scan window
+ * are parsed and then dropped by `parseText` via `monthBoundary`.
+ */
+function scanWholeFile(file: string, size: number, monthBoundary: number): UsageEvent[] {
+  const events: UsageEvent[] = [];
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(readChunkBytes);
+    let carry = '';
+    let position = 0;
+    while (position < size) {
+      const toRead = Math.min(readChunkBytes, size - position);
+      const read = fs.readSync(fd, buffer, 0, toRead, position);
+      if (read <= 0) {
+        break;
+      }
+      position += read;
+      const text = carry + buffer.toString('utf8', 0, read);
+      const lastNewline = text.lastIndexOf('\n');
+      if (lastNewline === -1) {
+        // No line boundary yet; keep buffering (a single line this large is
+        // pathological, so cap the carry to avoid unbounded growth).
+        carry = text.length > readChunkBytes ? '' : text;
+        continue;
+      }
+      carry = text.slice(lastNewline + 1);
+      const complete = text.slice(0, lastNewline + 1);
+      for (const event of parseText(complete, monthBoundary)) {
+        events.push(event);
+      }
+    }
+    if (carry) {
+      for (const event of parseText(carry, monthBoundary)) {
+        events.push(event);
+      }
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return events;
 }
 
 function merge(existing: UsageEvent[], added: UsageEvent[]): UsageEvent[] {
@@ -145,9 +220,8 @@ function scanFile(file: string, request: Request): Response | undefined {
     return { file, size, mtimeMs, events: previous.events };
   }
 
-  // First sighting: read only the tail, then remember the whole event set.
-  const start = Math.max(0, size - initialTailBytes);
-  const events = parseText(readRange(file, start, size, start > 0), request.monthBoundary);
+  // First sighting: stream the whole file so no in-month record is missed.
+  const events = scanWholeFile(file, size, request.monthBoundary);
   cache.set(file, { size, mtimeMs, offset: size, events });
   return { file, size, mtimeMs, events };
 }
