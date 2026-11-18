@@ -1,0 +1,46 @@
+{
+  "name": "copilot-credit-cost-tracker",
+  "displayName": "Copilot Credit Cost Tracker",
+  "description": "Tracks locally reported GitHub Copilot AI credits and converts them to USD.",
+  "version": "0.3.0",
+  "publisher": "local",
+  "engines": { "vscode": "^1.139.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "copilotCostTracker.showReport", "title": "Copilot Cost: Show Report" },
+      { "command": "copilotCostTracker.refresh", "title": "Copilot Cost: Refresh" },
+      { "command": "copilotCostTracker.exportCsv", "title": "Copilot Cost: Export CSV" }
+    ],
+    "configuration": {
+      "title": "Copilot Cost Tracker",
+      "properties": {
+        "copilotCostTracker.usdPerCredit": {
+          "type": "number",
+          "default": 0.01,
+          "minimum": 0,
+          "description": "USD value of one locally reported AI credit."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npm run compile && npx --yes @vscode/vsce package --allow-missing-repository"
+  },
+  "files": [
+    "dist/extension.js",
+    "dist/scannerWorker.js",
+    "package.json"
+  ],
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.139.0",
+    "typescript": "^5.9.0",
+    "@vscode/vsce": "^3.6.0"
+  }
+}
+
