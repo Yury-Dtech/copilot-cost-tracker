@@ -88,7 +88,7 @@ function dayKey(date: Date): string {
 function findJsonlFiles(): ScannedFile[] {
   const appData = process.env.APPDATA;
   if (!appData) {
-    return [];
+    return findHarnessFiles();
   }
 
   const userRoot = path.join(appData, 'Code', 'User');
@@ -132,7 +132,51 @@ function findJsonlFiles(): ScannedFile[] {
   for (const root of roots) {
     visit(root.directory, root.workspace);
   }
+  // Agent-host sessions bill here. debug-logs no longer get an llm_request for them.
+  files.push(...findHarnessFiles());
   return files;
+}
+
+/** Copilot SDK session log. Workspace label comes from that session's workspace.yaml. */
+function findHarnessFiles(): ScannedFile[] {
+  const files: ScannedFile[] = [];
+  let sessions: fs.Dirent[];
+  try {
+    sessions = fs.readdirSync(path.join(os.homedir(), '.copilot', 'session-state'), { withFileTypes: true });
+  } catch {
+    return files;
+  }
+
+  for (const session of sessions) {
+    if (!session.isDirectory()) {
+      continue;
+    }
+    const folder = path.join(os.homedir(), '.copilot', 'session-state', session.name);
+    const events = path.join(folder, 'events.jsonl');
+    try {
+      if (!fs.statSync(events).isFile()) {
+        continue;
+      }
+    } catch {
+      continue;
+    }
+    files.push({ file: events, workspace: harnessWorkspace(folder) });
+  }
+  return files;
+}
+
+function harnessWorkspace(folder: string): string {
+  try {
+    const raw = fs.readFileSync(path.join(folder, 'workspace.yaml'), 'utf8');
+    const line = raw.match(/^(?:git_root|cwd):\s*(.+)$/m)?.[1]?.trim().replace(/^["']|["']$/g, '');
+    const base = line ? path.basename(line) : '';
+    if (base) {
+      return base;
+    }
+  } catch {
+    // Session without workspace metadata.
+  }
+  return 'Copilot';
 }
 
 /**
@@ -279,7 +323,7 @@ function formatPct(value: number | undefined): string {
   return `${Math.round(value * 100)}%`;
 }
 
-function renderReportHtml(data: UsageSnapshot | undefined, usdPerCredit: number): string {
+function renderReportHtml(data: UsageSnapshot | undefined, usdPerCredit: number, officialCredits: number): string {
   const style = `
     :root { color-scheme: light dark; }
     body { font-family: var(--vscode-font-family); padding: 20px 24px; color: var(--vscode-foreground); max-width: 1100px; }
@@ -289,6 +333,7 @@ function renderReportHtml(data: UsageSnapshot | undefined, usdPerCredit: number)
     .card { border: 1px solid var(--vscode-panel-border, rgba(128,128,128,.35)); border-radius: 8px; padding: 12px 14px; }
     .card .label { color: var(--vscode-descriptionForeground); font-size: 0.78em; text-transform: uppercase; letter-spacing: .04em; }
     .card .value { font-size: 1.6em; font-weight: 600; margin-top: 4px; }
+    .card .note { color: var(--vscode-descriptionForeground); font-size: 0.75em; margin-top: 4px; }
     section { margin-bottom: 28px; }
     h2 { font-size: 1.05em; font-weight: 600; margin: 0 0 10px; }
     table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
@@ -407,6 +452,12 @@ function renderReportHtml(data: UsageSnapshot | undefined, usdPerCredit: number)
     ? 'Every elapsed day this month has local data.'
     : `${data.coveredDays.length} of ${data.elapsedDays} elapsed days have local data. Missing: ${missingDays.join(', ')}. These may be usage from another device, the browser, mobile, or logs the Copilot extension already rotated.`;
 
+  // Optional reconciliation against the number shown in the GitHub profile.
+  const localCredits = data.overall.nanoAiu / nanoAiuPerCredit;
+  const gapCard = officialCredits > 0
+    ? `<div class="card"><div class="label">Unaccounted vs profile</div><div class="value">${Math.round(officialCredits - localCredits).toLocaleString('en-US')} credits</div><div class="note">profile ${officialCredits.toLocaleString('en-US')} · local ${Math.round(localCredits).toLocaleString('en-US')} · ${Math.round((1 - localCredits / officialCredits) * 100)}% gap</div></div>`
+    : '';
+
   return `<!doctype html><html><head><meta charset="utf-8"><style>${style}</style></head><body>
     <h1>Copilot costs</h1>
     <div class="sub">Locally reported AI credits, converted at $${usdPerCredit}/credit. <strong>This reflects this VS Code only; the GitHub profile may show more.</strong></div>
@@ -417,6 +468,7 @@ function renderReportHtml(data: UsageSnapshot | undefined, usdPerCredit: number)
       <div class="card"><div class="label">Session (since ${since})</div><div class="value">${formatUsd(data.sessionUsd)}</div></div>
       <div class="card"><div class="label">Prompt cache hit</div><div class="value">${formatPct(overallRate)}</div></div>
       <div class="card"><div class="label">Requests this month</div><div class="value">${data.overall.events.toLocaleString('en-US')}</div></div>
+      ${gapCard}
     </div>
 
     <section>
@@ -475,11 +527,16 @@ export function activate(context: vscode.ExtensionContext): void {
   const readUsdPerCredit = (): number =>
     vscode.workspace.getConfiguration('copilotCostTracker').get<number>('usdPerCredit', 0.01);
 
+  const readOfficialCredits = (): number =>
+    vscode.workspace.getConfiguration('copilotCostTracker').get<number>('officialMonthlyCredits', 0);
+
   const runner = new ScanRunner();
   const allEvents = new Map<string, UsageEvent[]>();
+  const reportPanels = new Set<vscode.WebviewPanel>();
   /** File path -> workspace label, refreshed on every scan. */
   const fileWorkspace = new Map<string, string>();
   let snapshot: UsageSnapshot | undefined;
+  let lastReportHtml = '';
   let timer: NodeJS.Timeout | undefined;
   let refreshing = false;
 
@@ -615,6 +672,14 @@ export function activate(context: vscode.ExtensionContext): void {
     tooltip.supportHtml = false;
     statusBar.tooltip = tooltip;
     statusBar.show();
+
+    const reportHtml = renderReportHtml(data, usdPerCredit, readOfficialCredits());
+    if (reportHtml !== lastReportHtml) {
+      lastReportHtml = reportHtml;
+      for (const panel of reportPanels) {
+        panel.webview.html = reportHtml;
+      }
+    }
   };
 
   const refresh = async (): Promise<void> => {
@@ -669,7 +734,10 @@ export function activate(context: vscode.ExtensionContext): void {
       enableScripts: true
     });
 
-    panel.webview.html = renderReportHtml(data, usdPerCredit);
+    reportPanels.add(panel);
+    panel.onDidDispose(() => reportPanels.delete(panel));
+    panel.webview.html = renderReportHtml(data, usdPerCredit, readOfficialCredits());
+    lastReportHtml = panel.webview.html;
   };
 
   context.subscriptions.push(
@@ -706,7 +774,10 @@ export function activate(context: vscode.ExtensionContext): void {
       await fs.promises.writeFile(uri.fsPath, lines.join('\r\n'), 'utf8');
     }),
     vscode.workspace.onDidChangeConfiguration(event => {
-      if (event.affectsConfiguration('copilotCostTracker.usdPerCredit')) {
+      if (
+        event.affectsConfiguration('copilotCostTracker.usdPerCredit') ||
+        event.affectsConfiguration('copilotCostTracker.officialMonthlyCredits')
+      ) {
         void refresh();
       }
     }),

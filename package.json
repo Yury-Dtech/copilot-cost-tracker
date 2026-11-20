@@ -2,7 +2,7 @@
   "name": "copilot-credit-cost-tracker",
   "displayName": "Copilot Credit Cost Tracker",
   "description": "Tracks locally reported GitHub Copilot AI credits and converts them to USD.",
-  "version": "0.4.0",
+  "version": "0.5.1",
   "publisher": "local",
   "engines": { "vscode": "^1.139.0" },
   "categories": ["Other"],
@@ -22,6 +22,12 @@
           "default": 0.01,
           "minimum": 0,
           "description": "USD value of one locally reported AI credit."
+        },
+        "copilotCostTracker.officialMonthlyCredits": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "AI credits for the current month as shown in the GitHub Copilot profile. When set, the report compares it with locally logged usage and shows the gap (server-side Fusion passes, other devices, or the browser). Set 0 to hide the comparison."
         }
       }
     }

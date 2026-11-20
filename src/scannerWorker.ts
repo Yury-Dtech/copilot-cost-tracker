@@ -84,6 +84,16 @@ function parseText(text: string, monthBoundary: number): UsageEvent[] {
       previousAiu = total;
       eventId = typeof record.eventId === 'string' ? record.eventId : undefined;
       sessionId = typeof record.sessionId === 'string' ? record.sessionId : '';
+    } else if (record?.type === 'session.usage_record') {
+      const usage = record.data?.usage;
+      timestamp = typeof record.timestamp === 'string' ? Date.parse(record.timestamp) : undefined;
+      model = typeof usage?.model === 'string' ? usage.model : undefined;
+      charge = typeof usage?.copilotUsage?.totalNanoAiu === 'number' ? usage.copilotUsage.totalNanoAiu : undefined;
+      eventId = typeof record.id === 'string' ? record.id : undefined;
+      sessionId = typeof usage?.accounting?.sourceSessionId === 'string' ? usage.accounting.sourceSessionId : '';
+      cachedTokens = toNumber(usage?.cacheReadTokens);
+      inputTokens = toNumber(usage?.inputTokens);
+      outputTokens = toNumber(usage?.outputTokens);
     }
 
     if (!timestamp || !model || !charge || charge <= 0 || !Number.isFinite(charge) || !eventId) {
@@ -250,3 +260,31 @@ parentPort?.on('message', (request: Request) => {
 });
 
 parentPort?.postMessage('ready');
+
+if (process.argv.includes('--self-check')) {
+  const charged = parseText(JSON.stringify({
+    type: 'session.usage_record',
+    id: 'evt-1',
+    timestamp: '2026-11-20T08:00:00.000Z',
+    data: {
+      usage: {
+        model: 'mai-code-2',
+        inputTokens: 10,
+        outputTokens: 2,
+        cacheReadTokens: 4,
+        accounting: { sourceSessionId: 'sess-1' },
+        copilotUsage: { totalNanoAiu: 227967250 }
+      }
+    }
+  }), 0);
+  const skipped = parseText(JSON.stringify({
+    type: 'session.usage_record',
+    id: 'evt-0',
+    timestamp: '2026-11-20T08:00:00.000Z',
+    data: { usage: { model: 'local', copilotUsage: { totalNanoAiu: 0 } } }
+  }), 0);
+  if (charged.length !== 1 || charged[0].charge !== 227967250 || charged[0].model !== 'mai-code-2' || charged[0].sessionId !== 'sess-1' || charged[0].cachedTokens !== 4 || skipped.length !== 0) {
+    throw new Error('session.usage_record parse failed');
+  }
+  console.log('scanner self-check ok');
+}
